@@ -19,7 +19,7 @@ pre: |
 
   export SOURCE_DATE_EPOCH='[% c("timestamp") %]'
   tar -xf [% c('input_files_by_name/mmdebstrap') %]
-  ./mmdebstrap/mmdebstrap --mode=unshare [% c("var/container/mmdebstrap_opt") %] [% c("var/container/suite") %] output.tar.[% c('compress_tar') %] [% c("var/container/debian_mirror") %]
+  ./mmdebstrap/mmdebstrap --mode=root [% c("var/container/mmdebstrap_opt") %] [% c("var/container/suite") %] output.tar.[% c('compress_tar') %] [% c("var/container/debian_mirror") %]
 
   [% IF c("var/minimal_apt_version") -%]
     mkdir base-image
