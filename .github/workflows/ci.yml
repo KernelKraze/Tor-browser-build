@@ -41,7 +41,7 @@ jobs:
         continue-on-error: true
         id: build
         run: |
-          ./rbm/rbm build tor --target nightly --target linux-x86_64
+          ./rbm/rbm build tor --target nightly --target linux-x86_64 --target linux
 
       - name: Dump build logs on failure
         if: steps.build.outcome != 'success'
