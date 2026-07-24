@@ -12,7 +12,8 @@ container:
 targets:
   nightly:
     version: '[% c("abbrev") %]'
-    git_hash: main
+    git_url: https://github.com/KernelKraze/The-Onion-Router.git
+    git_hash: ci/github-actions
     tag_gpg_id: 0
 
   windows:
