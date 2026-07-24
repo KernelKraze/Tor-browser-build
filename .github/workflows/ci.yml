@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  RBM_NO_DEBUG: 1
+
+jobs:
+  build-tor:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Enable user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get -qq install -y uidmap zstd jq zip \
+            libyaml-libyaml-perl libtemplate-perl libcapture-tiny-perl \
+            libjson-perl libpath-tiny-perl libfile-slurp-perl \
+            libfile-copy-recursive-perl libstring-shellquote-perl \
+            libsort-versions-perl libdata-uuid-perl libdata-dump-perl \
+            libdatetime-perl libxml-writer-perl libparallel-forkmanager-perl
+
+      - name: Build tor project
+        run: |
+          ./rbm/rbm build tor --target nightly --target linux-x86_64
