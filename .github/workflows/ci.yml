@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 env:
-  RBM_NO_DEBUG: 1
+  RBM_NO_DEBUG: 0
 
 jobs:
   build-tor:
@@ -38,5 +38,20 @@ jobs:
           echo "runner:100000:65536" | sudo tee /etc/subgid
 
       - name: Build tor project
+        continue-on-error: true
+        id: build
         run: |
           ./rbm/rbm build tor --target nightly --target linux-x86_64
+
+      - name: Dump build logs on failure
+        if: steps.build.outcome != 'success'
+        run: |
+          echo "=== mmdebstrap.log ==="
+          cat logs/mmdebstrap.log 2>/dev/null || echo "(not found)"
+          echo "=== mmdebstrap-image.log ==="
+          cat logs/mmdebstrap-image.log 2>/dev/null || echo "(not found)"
+          echo "=== container-image.log ==="
+          cat logs/container-image.log 2>/dev/null || echo "(not found)"
+          echo "=== rbm debug output ==="
+          ls -la tmp/rbm-*/ 2>/dev/null | head -20 || echo "(no tmp dirs)"
+          exit 1
