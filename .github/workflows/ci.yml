@@ -7,12 +7,12 @@ on:
     branches: [main]
 
 env:
-  RBM_NO_DEBUG: 0
+  RBM_NO_DEBUG: 1
 
 jobs:
   build-tor:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
@@ -31,27 +31,6 @@ jobs:
             libsort-versions-perl libdata-uuid-perl libdata-dump-perl \
             libdatetime-perl libxml-writer-perl libparallel-forkmanager-perl
 
-      - name: Configure user namespaces for mmdebstrap
-        run: |
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
-          echo "runner:100000:65536" | sudo tee /etc/subuid
-          echo "runner:100000:65536" | sudo tee /etc/subgid
-
       - name: Build tor project
-        continue-on-error: true
-        id: build
         run: |
           ./rbm/rbm build tor --target nightly --target linux-x86_64 --target linux
-
-      - name: Dump build logs on failure
-        if: steps.build.outcome != 'success'
-        run: |
-          echo "=== mmdebstrap.log ==="
-          cat logs/mmdebstrap.log 2>/dev/null || echo "(not found)"
-          echo "=== mmdebstrap-image.log ==="
-          cat logs/mmdebstrap-image.log 2>/dev/null || echo "(not found)"
-          echo "=== container-image.log ==="
-          cat logs/container-image.log 2>/dev/null || echo "(not found)"
-          echo "=== rbm debug output ==="
-          ls -la tmp/rbm-*/ 2>/dev/null | head -20 || echo "(no tmp dirs)"
-          exit 1
