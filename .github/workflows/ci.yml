@@ -5,8 +5,23 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    # Nightly at 03:00 UTC. The heavy browser builds run ONLY on this schedule
+    # and on manual dispatch -- never on every push/PR (a full build is hours).
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+# Cancel a superseded run on the same ref+event instead of stacking multi-hour
+# builds. event_name is part of the group so a push to main does NOT cancel an
+# in-progress nightly (they share the main ref but differ by event).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  # Fast smoke build of tor itself. Runs on every trigger and gates the heavy
+  # browser builds, so a tor that does not compile fails in ~minutes instead of
+  # burning a multi-hour runner.
   build-tor:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -32,19 +47,55 @@ jobs:
           cd tor
           autoreconf -fi
           ./configure --enable-fatal-warnings --disable-asciidoc
-          make -j$(nproc)
+          make -j"$(nproc)"
 
-  build-tor-browser-windows:
+  build-tor-browser:
+    # Heavy reproducible build: schedule / manual only, and only after tor
+    # itself compiles.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: build-tor
     runs-on: ubuntu-24.04
-    timeout-minutes: 540
+    # GitHub-hosted runners hard-cap a job at 6h (360 min); a larger value is
+    # silently ignored. A cold full build can exceed this -- the rbm cache
+    # below is what keeps a nightly under the cap. For a guaranteed >6h build,
+    # move this job to a self-hosted runner and raise the timeout.
+    timeout-minutes: 350
     permissions:
       contents: write
+    strategy:
+      # One platform failing must not abort the other.
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x86_64
+            title: Windows x86_64
+            tag_infix: ''
+            installer_glob: '*.exe'
+            rbm_targets: >-
+              --target browser-single-platform
+              --target browser-windows-x86_64
+              --target torbrowser
+          - platform: macos-aarch64
+            title: macOS aarch64 (Apple Silicon)
+            tag_infix: 'macos-'
+            installer_glob: '*.dmg'
+            rbm_targets: >-
+              --target browser-single-platform
+              --target torbrowser-macos-aarch64
     steps:
       - name: Checkout tor-browser-build
         uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 1
+
+      - name: Free up disk space
+        run: |
+          # A full Tor Browser build is large; the stock runner image leaves
+          # only ~14 GB free on /. Reclaim space we never use here.
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /usr/local/share/boost "${AGENT_TOOLSDIRECTORY:-}" || true
+          df -h /
 
       - name: Enable user namespaces
         run: |
@@ -66,16 +117,31 @@ jobs:
             libtemplate-perl libxml-libxml-perl libxml-writer-perl \
             libyaml-libyaml-perl
 
+      - name: Restore rbm cache
+        uses: actions/cache/restore@v4
+        with:
+          # git_clones: rbm's source mirror. out: content-addressed store of
+          # already-built components (toolchains, NSS, rust, ...). Persisting
+          # these lets each nightly resume instead of rebuilding every
+          # toolchain from scratch -- the main reason a cold build is so long.
+          # CAVEAT: the Actions cache is capped at ~10 GB per repo; out/ may
+          # exceed it, in which case the save is skipped (non-fatal) and only
+          # git_clones survives. A self-hosted runner with a persistent out/
+          # avoids the cap entirely and is the real fix for >6h builds.
+          path: |
+            git_clones
+            out
+          key: rbm-${{ matrix.platform }}-${{ github.run_id }}
+          restore-keys: |
+            rbm-${{ matrix.platform }}-
+
       - name: Generate nightly version
         id: version
         run: |
           SHORT_SHA="${GITHUB_SHA::7}"
           DATE=$(date -u +%Y.%m.%d)
-          VERSION="tbb-nightly.${DATE}"
-          TAG="nightly-${DATE}-${SHORT_SHA}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "Nightly version: ${VERSION}, tag: ${TAG}"
+          echo "version=tbb-nightly.${DATE}" >> "$GITHUB_OUTPUT"
+          echo "tag=nightly-${DATE}-${{ matrix.tag_infix }}${SHORT_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Verify Tor source before build
         run: |
@@ -89,15 +155,25 @@ jobs:
           echo "=== Browser input_files (tor-expert-bundle) ==="
           grep -A2 'tor-expert-bundle' projects/browser/config
 
-      - name: Build Tor Browser Windows x86_64 (nightly)
+      - name: Build Tor Browser (${{ matrix.title }}, nightly)
         env:
           RBM_NO_DEBUG: "1"
         run: |
           ./rbm/rbm build release \
             --target nightly \
-            --target browser-single-platform \
-            --target browser-windows-x86_64 \
-            --target torbrowser
+            ${{ matrix.rbm_targets }}
+
+      - name: Save rbm cache
+        # Persist even on failure/timeout so a partially built toolchain is not
+        # discarded -- the next run restores it via the restore-keys prefix and
+        # continues. Cache-save errors (e.g. >10 GB) are non-fatal.
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            git_clones
+            out
+          key: rbm-${{ matrix.platform }}-${{ github.run_id }}
 
       - name: Collect build metadata
         id: meta
@@ -105,12 +181,12 @@ jobs:
         run: |
           META_DIR="torbrowser/nightly-build-info"
           mkdir -p "$META_DIR"
-
           {
             echo "=== Build Metadata ==="
             echo "Build timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "GitHub commit: ${GITHUB_SHA}"
             echo "GitHub ref: ${GITHUB_REF}"
+            echo "Platform: ${{ matrix.title }}"
             echo "Nightly version: ${{ steps.version.outputs.version }}"
             echo ""
             echo "=== Tor Source ==="
@@ -124,7 +200,6 @@ jobs:
             echo "Tor project nightly config:"
             sed -n '/^  nightly:/,/^[^ ]/p' projects/tor/config
           } > "${META_DIR}/build-info.txt"
-
           echo "build_info_dir=${META_DIR}" >> "$GITHUB_OUTPUT"
           cat "${META_DIR}/build-info.txt"
 
@@ -132,16 +207,16 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: tor-browser-windows-x86_64-nightly
+          name: tor-browser-${{ matrix.platform }}-nightly
           path: |
-            torbrowser/nightly/**/*.exe
+            torbrowser/nightly/**/${{ matrix.installer_glob }}
             torbrowser/nightly/**/*.sha256sums
             torbrowser/nightly-build-info/build-info.txt
           retention-days: 14
           if-no-files-found: warn
 
       - name: Create GitHub Pre-release
-        if: success() && github.event_name == 'push'
+        if: success()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -154,199 +229,35 @@ jobs:
             exit 1
           fi
 
-          EXE_FILE=$(find "$RELEASE_DIR" -name '*.exe' | head -1)
+          INSTALLER_FILE=$(find "$RELEASE_DIR" -name '${{ matrix.installer_glob }}' | head -1)
           SHA_FILE=$(find "$RELEASE_DIR" -name '*.sha256sums' | head -1)
 
-          if [ -z "$EXE_FILE" ]; then
-            echo "::error::No .exe installer found in ${RELEASE_DIR}"
+          if [ -z "$INSTALLER_FILE" ]; then
+            echo "::error::No ${{ matrix.installer_glob }} installer found in ${RELEASE_DIR}"
             exit 1
           fi
 
           BUILD_INFO="${{ steps.meta.outputs.build_info_dir }}/build-info.txt"
 
           {
-          echo "## Tor Browser Nightly — Windows x86_64"
-          echo ""
-          echo "**Version:** ${VERSION}"
-          echo "**Platform:** Windows x86_64"
-          echo "**Channel:** Nightly"
-          echo "**Tor source:** KernelKraze/The-Onion-Router @ ci/github-actions"
-          echo "**CI commit:** ${GITHUB_SHA::7}"
-          echo ""
-          echo "> Files are unsigned — do not use in production."
+            echo "## Tor Browser Nightly — ${{ matrix.title }}"
+            echo ""
+            echo "**Version:** ${VERSION}"
+            echo "**Platform:** ${{ matrix.title }}"
+            echo "**Channel:** Nightly"
+            echo "**Tor source:** KernelKraze/The-Onion-Router @ ci/github-actions"
+            echo "**CI commit:** ${GITHUB_SHA::7}"
+            echo ""
+            echo "> Files are unsigned — do not use in production."
           } > /tmp/release-notes.txt
 
-          ASSETS=""
-          ASSETS="${EXE_FILE}"
-          if [ -n "$SHA_FILE" ]; then
-            ASSETS="${ASSETS} ${SHA_FILE}"
-          fi
-          if [ -f "$BUILD_INFO" ]; then
-            ASSETS="${ASSETS} ${BUILD_INFO}"
-          fi
+          ASSETS="${INSTALLER_FILE}"
+          [ -n "$SHA_FILE" ] && ASSETS="${ASSETS} ${SHA_FILE}"
+          [ -f "$BUILD_INFO" ] && ASSETS="${ASSETS} ${BUILD_INFO}"
 
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "Tor Browser Nightly ${VERSION} — Windows x86_64" \
-            --notes-file /tmp/release-notes.txt \
-            --prerelease \
-            $ASSETS
-
-          echo "Pre-release created: ${TAG}"
-
-  build-tor-browser-macos:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 540
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout tor-browser-build
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          fetch-depth: 1
-
-      - name: Enable user namespaces
-        run: |
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          echo "kernel.apparmor_restrict_unprivileged_userns=0" | \
-            sudo tee /etc/sysctl.d/99-userns.conf > /dev/null
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get -qq update
-          sudo apt-get -qq install -y \
-            git uidmap zstd jq zip \
-            libdata-dump-perl libdata-uuid-perl libdatetime-perl \
-            libdigest-sha-perl libfile-copy-recursive-perl \
-            libfile-slurp-perl libio-all-perl libcapture-tiny-perl \
-            libio-handle-util-perl libjson-perl \
-            libparallel-forkmanager-perl libpath-tiny-perl \
-            libsort-versions-perl libstring-shellquote-perl \
-            libtemplate-perl libxml-libxml-perl libxml-writer-perl \
-            libyaml-libyaml-perl
-
-      - name: Generate nightly version
-        id: version
-        run: |
-          SHORT_SHA="${GITHUB_SHA::7}"
-          DATE=$(date -u +%Y.%m.%d)
-          VERSION="tbb-nightly.${DATE}"
-          TAG="nightly-${DATE}-macos-${SHORT_SHA}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "Nightly version: ${VERSION}, tag: ${TAG}"
-
-      - name: Verify Tor source before build
-        run: |
-          echo "=== Tor source verification ==="
-          echo "Tor Browser Build repo commit: ${GITHUB_SHA}"
-          echo "Tor source (nightly target): https://github.com/KernelKraze/The-Onion-Router.git @ ci/github-actions"
-          echo ""
-          echo "=== rbm.conf tor project config ==="
-          grep -A5 'nightly:' projects/tor/config
-          echo ""
-          echo "=== Browser input_files (tor-expert-bundle) ==="
-          grep -A2 'tor-expert-bundle' projects/browser/config
-
-      - name: Build Tor Browser macOS aarch64 (nightly)
-        env:
-          RBM_NO_DEBUG: "1"
-        run: |
-          ./rbm/rbm build release \
-            --target nightly \
-            --target browser-single-platform \
-            --target torbrowser-macos-aarch64
-
-      - name: Collect build metadata
-        id: meta
-        if: always()
-        run: |
-          META_DIR="torbrowser/nightly-build-info"
-          mkdir -p "$META_DIR"
-
-          {
-            echo "=== Build Metadata ==="
-            echo "Build timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "GitHub commit: ${GITHUB_SHA}"
-            echo "GitHub ref: ${GITHUB_REF}"
-            echo "Nightly version: ${{ steps.version.outputs.version }}"
-            echo ""
-            echo "=== Tor Source ==="
-            echo "Repository: https://github.com/KernelKraze/The-Onion-Router.git"
-            echo "Branch: ci/github-actions"
-            echo ""
-            echo "=== Tor Browser Build Config ==="
-            echo "Tor version in rbm.conf:"
-            grep 'torbrowser_version:' rbm.conf | head -1
-            echo ""
-            echo "Tor project nightly config:"
-            sed -n '/^  nightly:/,/^[^ ]/p' projects/tor/config
-          } > "${META_DIR}/build-info.txt"
-
-          echo "build_info_dir=${META_DIR}" >> "$GITHUB_OUTPUT"
-          cat "${META_DIR}/build-info.txt"
-
-      - name: Upload to Actions Artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: tor-browser-macos-aarch64-nightly
-          path: |
-            torbrowser/nightly/**/*.dmg
-            torbrowser/nightly/**/*.sha256sums
-            torbrowser/nightly-build-info/build-info.txt
-          retention-days: 14
-          if-no-files-found: warn
-
-      - name: Create GitHub Pre-release
-        if: success() && github.event_name == 'push'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="${{ steps.version.outputs.tag }}"
-          VERSION="${{ steps.version.outputs.version }}"
-
-          RELEASE_DIR=$(find torbrowser/nightly -maxdepth 1 -mindepth 1 -type d | head -1)
-          if [ -z "$RELEASE_DIR" ]; then
-            echo "::error::No nightly release directory found under torbrowser/nightly/"
-            exit 1
-          fi
-
-          DMG_FILE=$(find "$RELEASE_DIR" -name '*.dmg' | head -1)
-          SHA_FILE=$(find "$RELEASE_DIR" -name '*.sha256sums' | head -1)
-
-          if [ -z "$DMG_FILE" ]; then
-            echo "::error::No .dmg installer found in ${RELEASE_DIR}"
-            exit 1
-          fi
-
-          BUILD_INFO="${{ steps.meta.outputs.build_info_dir }}/build-info.txt"
-
-          {
-          echo "## Tor Browser Nightly — macOS aarch64"
-          echo ""
-          echo "**Version:** ${VERSION}"
-          echo "**Platform:** macOS aarch64 (Apple Silicon)"
-          echo "**Channel:** Nightly"
-          echo "**Tor source:** KernelKraze/The-Onion-Router @ ci/github-actions"
-          echo "**CI commit:** ${GITHUB_SHA::7}"
-          echo ""
-          echo "> Files are unsigned — do not use in production."
-          } > /tmp/release-notes.txt
-
-          ASSETS=""
-          ASSETS="${DMG_FILE}"
-          if [ -n "$SHA_FILE" ]; then
-            ASSETS="${ASSETS} ${SHA_FILE}"
-          fi
-          if [ -f "$BUILD_INFO" ]; then
-            ASSETS="${ASSETS} ${BUILD_INFO}"
-          fi
-
-          gh release create "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Tor Browser Nightly ${VERSION} — macOS aarch64" \
+            --title "Tor Browser Nightly ${VERSION} — ${{ matrix.title }}" \
             --notes-file /tmp/release-notes.txt \
             --prerelease \
             $ASSETS
