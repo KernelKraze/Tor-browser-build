@@ -25,6 +25,10 @@
   LangString standalone_installation ${LANG_ENGLISH} "Standalone installation"
   ; Use %s instead of ${PROJECT_NAME} for localization
   LangString standalone_description ${LANG_ENGLISH} "Choose the standalone installation if you want to install ${PROJECT_NAME} in its own dedicated folder, without adding it to the Start menu and to the list of applications."
+  LangString custom_notice ${LANG_ENGLISH} "Notice: The Tor core in this build has been modified. Source: https://github.com/KernelKraze/The-Onion-Router"
 
   ; The rest of the languages and translated strings will be added here by
   ; add-strings.py.
+
+  ; Custom translations for modified builds
+  LangString custom_notice ${LANG_SimpChinese} "注意: 本构建中的 Tor 核心程序已修改. 源码: https://github.com/KernelKraze/The-Onion-Router"

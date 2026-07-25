@@ -118,6 +118,13 @@ Function SetupType
   SetCtlColors $typeRadioAdvanced "" ${MUI_BGCOLOR}
   ${NSD_OnClick} $typeRadioAdvanced SetupTypeRadioClick
 
+  ; Custom notice for modified Tor core builds
+  ${NSD_CreateLabel} 120u 148u 195u 24u "$(custom_notice)"
+  Pop $0
+  SetCtlColors $0 "${MUI_TEXTCOLOR}" "${MUI_BGCOLOR}"
+  CreateFont $3 "$(^Font)" "8" "400"
+  SendMessage $0 ${WM_SETFONT} $3 0
+
   GetDlgItem $typeNextButton $HWNDPARENT 1
 
   ; Re-check radios if the user presses back
