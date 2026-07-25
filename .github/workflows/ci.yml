@@ -17,6 +17,7 @@ jobs:
           repository: KernelKraze/The-Onion-Router
           ref: ci/github-actions
           path: tor
+          fetch-depth: 1
 
       - name: Install build dependencies
         run: |
