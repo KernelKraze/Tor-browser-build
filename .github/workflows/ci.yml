@@ -24,13 +24,19 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get -qq update
-          sudo apt-get -qq install -y uidmap zstd jq zip \
+          sudo apt-get -qq install -y uidmap zstd jq zip build-essential \
             libyaml-libyaml-perl libtemplate-perl libcapture-tiny-perl \
             libjson-perl libpath-tiny-perl libfile-slurp-perl \
             libfile-copy-recursive-perl libstring-shellquote-perl \
             libsort-versions-perl libdata-uuid-perl libdata-dump-perl \
             libdatetime-perl libxml-writer-perl libparallel-forkmanager-perl
 
+      - name: Configure user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
+          echo "runner:100000:65536" | sudo tee /etc/subuid
+          echo "runner:100000:65536" | sudo tee /etc/subgid
+
       - name: Build tor project
         run: |
-          ./rbm/rbm build tor --target nightly --target linux-x86_64 --target linux
+          ./rbm/rbm build tor --target no_containers --target nightly --target linux-x86_64 --target linux
