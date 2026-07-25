@@ -15,7 +15,7 @@ pre: |
   rootdir=$(pwd)
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y -q
-  apt-get install -y -q debian-archive-keyring ubuntu-keyring mmdebstrap gnupg zstd
+  apt-get install -y -q debian-archive-keyring ubuntu-keyring mmdebstrap gnupg zstd iproute2
 
   export SOURCE_DATE_EPOCH='[% c("timestamp") %]'
   tar -xf [% c('input_files_by_name/mmdebstrap') %]
