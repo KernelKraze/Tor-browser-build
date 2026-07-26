@@ -174,9 +174,10 @@ jobs:
         run: |
           set -euo pipefail
           BROWSER_DIR='${{ steps.layout.outputs.browser_dir }}'
-          # Hash EVERY extracted file before we touch anything. Paths are kept
-          # relative to extracted/ so the manifest is stable across machines.
-          ( cd extracted && find . -type f -print0 | LC_ALL=C sort -z \
+          # Hash every file in the browser tree before we touch anything, paths
+          # relative to Browser/. NSIS installer cruft ($PLUGINSDIR etc.) is not
+          # part of what we ship, so it is excluded from the manifest.
+          ( cd "$BROWSER_DIR" && find . -type f -print0 | LC_ALL=C sort -z \
               | xargs -0 sha256sum ) > official.manifest
           echo "official files hashed: $(wc -l < official.manifest)"
           OFFICIAL_PKG_SHA="$(sha256sum official.exe | awk '{print $1}')"
@@ -261,22 +262,24 @@ jobs:
           V='${{ steps.ver.outputs.version }}'
           BROWSER_DIR='${{ steps.layout.outputs.browser_dir }}'
 
-          # Re-hash the whole tree AFTER injection.
-          ( cd extracted && find . -type f -print0 | LC_ALL=C sort -z \
+          # Re-hash the browser tree AFTER injection (paths relative to Browser/).
+          ( cd "$BROWSER_DIR" && find . -type f -print0 | LC_ALL=C sort -z \
               | xargs -0 sha256sum ) > product.manifest
 
-          # The three paths (relative to extracted/, "./"-prefixed) we allow to change.
-          rel() { printf './%s\n' "${1#extracted/}"; }
-          REL_TOR="$(rel "$BROWSER_DIR/TorBrowser/Tor/tor.exe")"
-          REL_POL="$(rel "$BROWSER_DIR/distribution/policies.json")"
-          REL_USR="$(rel "$BROWSER_DIR/TorBrowser/Data/Browser/profile.default/user.js")"
-          printf '%s\n' "$REL_TOR" "$REL_POL" "$REL_USR" | LC_ALL=C sort -u > allowed.paths
+          # The three paths (relative to Browser/) we allow to change.
+          printf '%s\n' \
+            './TorBrowser/Tor/tor.exe' \
+            './distribution/policies.json' \
+            './TorBrowser/Data/Browser/profile.default/user.js' \
+            | LC_ALL=C sort -u > allowed.paths
 
           # Every path that is added, removed, or content-changed vs official.
-          diff <(LC_ALL=C sort official.manifest) <(LC_ALL=C sort product.manifest) \
+          # diff exits 1 when files differ (the normal case here), which would
+          # trip `set -e`, so guard it.
+          { diff <(LC_ALL=C sort official.manifest) <(LC_ALL=C sort product.manifest) || true; } \
             | grep -E '^[<>] ' \
             | sed -E 's/^[<>] [0-9a-f]{64}  //' \
-            | LC_ALL=C sort -u > differing.paths
+            | LC_ALL=C sort -u > differing.paths || true
           echo "Files that differ from the official package:"; cat differing.paths
 
           # Anything outside the allowed three is a hard failure -- refuse to ship.
@@ -329,8 +332,15 @@ jobs:
           set -euo pipefail
           V='${{ steps.ver.outputs.version }}'
           BROWSER_DIR='${{ steps.layout.outputs.browser_dir }}'
-          ROOT="$(dirname "$BROWSER_DIR")"          # the "Tor Browser" folder
           BASE="TorBrowser-ourtor-${V}"
+
+          # Assemble a clean bundle root: a "Tor Browser" folder holding only the
+          # Browser tree. The NSIS payload extracts as Browser/ next to installer
+          # cruft ($PLUGINSDIR); we ship just the browser, wrapped so the layout
+          # is "Tor Browser/Browser/..." like a normal portable install.
+          STAGE="$RUNNER_TEMP/stage"
+          rm -rf "$STAGE"; mkdir -p "$STAGE/Tor Browser"
+          cp -a "$BROWSER_DIR" "$STAGE/Tor Browser/Browser"
 
           # Deterministic zip: fixed mtimes, sorted entries, no extra fields, so
           # a third party can reproduce the same archive. NOTE: byte-for-byte
@@ -338,9 +348,9 @@ jobs:
           # anchor is the per-file MANIFEST.txt, not the container bytes.
           export TZ=UTC
           SDE=1609459200   # 2021-01-01 UTC, fixed
-          find "$ROOT" -exec touch --no-dereference -d "@${SDE}" {} +
-          ( cd "$ROOT/.." && \
-            find "$(basename "$ROOT")" ! -name '.DS_Store' | LC_ALL=C sort \
+          find "$STAGE/Tor Browser" -exec touch --no-dereference -d "@${SDE}" {} +
+          ( cd "$STAGE" && \
+            find "Tor Browser" ! -name '.DS_Store' | LC_ALL=C sort \
               | zip -X -q -@ "$GITHUB_WORKSPACE/${BASE}.zip" )
 
           cp MANIFEST.txt "${BASE}.MANIFEST.txt"
