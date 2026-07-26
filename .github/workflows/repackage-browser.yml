@@ -164,13 +164,17 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # Public release asset -> resolve its download URL, then curl it
-          # (the asset itself needs no auth; gh api only reads public metadata).
-          URL="$(gh api repos/KernelKraze/The-Onion-Router/releases/latest \
-                   --jq '.assets[] | select(.name | test("windows-mingw64")) | .browser_download_url' \
+          # Our tor ships as PRE-releases, which /releases/latest excludes (it
+          # would 404). List releases and take the windows-mingw64 asset from
+          # the most recently published one (pre-releases included). The asset
+          # download itself needs no auth; gh api only reads public metadata.
+          URL="$(gh api 'repos/KernelKraze/The-Onion-Router/releases?per_page=20' \
+                   --jq 'sort_by(.published_at) | reverse | .[].assets[]
+                         | select(.name | test("windows-mingw64"))
+                         | .browser_download_url' \
                  | head -1)"
           if [ -z "$URL" ]; then
-            echo "::error::no windows-mingw64 asset on the latest The-Onion-Router release"; exit 1
+            echo "::error::no windows-mingw64 asset found in recent The-Onion-Router releases"; exit 1
           fi
           echo "tor.exe asset: $URL"
           curl -fSL "$URL" -o our-tor.exe
