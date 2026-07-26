@@ -81,8 +81,9 @@ jobs:
           # Need a 7-Zip that can unpack NSIS. Install the modern 7-Zip (`7zz`
           # from the 7zip package) and p7zip-full (`7z`) as a fallback, then use
           # whichever binary is actually present.
-          sudo apt-get -qq install -y jq zip curl file gnupg p7zip-full 7zip \
-            || sudo apt-get -qq install -y jq zip curl file gnupg p7zip-full
+          # nsis provides makensis, used to build the convenience installer .exe.
+          sudo apt-get -qq install -y jq zip curl file gnupg nsis p7zip-full 7zip \
+            || sudo apt-get -qq install -y jq zip curl file gnupg nsis p7zip-full
           SEVENZ="$(command -v 7zz || command -v 7z || command -v 7za || true)"
           if [ -z "$SEVENZ" ]; then
             echo "::error::no 7-Zip binary (7zz/7z/7za) available"; exit 1
@@ -353,19 +354,57 @@ jobs:
             find "Tor Browser" ! -name '.DS_Store' | LC_ALL=C sort \
               | zip -X -q -@ "$GITHUB_WORKSPACE/${BASE}.zip" )
 
+          # Convenience installer (.exe) wrapping the SAME Browser tree, adding a
+          # Start Tor Browser shortcut + uninstaller. Build the NSIS script with
+          # echoes (single quotes keep NSIS $-vars literal; double quotes inject
+          # the version/paths) to avoid heredoc indentation issues inside YAML.
+          {
+            echo 'Unicode true'
+            echo 'SetCompressor /SOLID lzma'
+            echo "Name \"Tor Browser (custom tor) ${V}\""
+            echo "OutFile \"${BASE}-installer.exe\""
+            echo 'InstallDir "$LOCALAPPDATA\Tor Browser"'
+            echo 'RequestExecutionLevel user'
+            echo 'Page directory'
+            echo 'Page instfiles'
+            echo 'UninstPage uninstConfirm'
+            echo 'UninstPage instfiles'
+            echo 'Section "Install"'
+            echo '  SetOutPath "$INSTDIR"'
+            echo "  File /r \"${STAGE}/Tor Browser/Browser\""
+            echo '  CreateShortCut "$INSTDIR\Start Tor Browser.lnk" "$INSTDIR\Browser\firefox.exe" "" "$INSTDIR\Browser\firefox.exe" 0'
+            echo '  CreateShortCut "$SMPROGRAMS\Start Tor Browser.lnk" "$INSTDIR\Browser\firefox.exe" "" "$INSTDIR\Browser\firefox.exe" 0'
+            echo '  WriteUninstaller "$INSTDIR\Uninstall.exe"'
+            echo 'SectionEnd'
+            echo 'Section "Uninstall"'
+            echo '  Delete "$SMPROGRAMS\Start Tor Browser.lnk"'
+            echo '  RMDir /r "$INSTDIR"'
+            echo 'SectionEnd'
+          } > installer.nsi
+          makensis -V2 installer.nsi
+          test -f "${BASE}-installer.exe" || { echo "::error::installer build failed"; exit 1; }
+
+          {
+            echo
+            echo "Two forms are provided, both carrying the identical Browser/ tree above:"
+            echo "  - ${BASE}.zip            portable folder (auditable form)"
+            echo "  - ${BASE}-installer.exe  NSIS installer (adds a Start Tor Browser"
+            echo "      shortcut + uninstaller). Its stub is NSIS-generated and not"
+            echo "      byte-reproducible; verify the payload via the portable form."
+          } >> MANIFEST.txt
           cp MANIFEST.txt "${BASE}.MANIFEST.txt"
 
           if [ -n "${BUNDLE_PASSPHRASE:-}" ]; then
-            "$SEVENZ" a -p"$BUNDLE_PASSPHRASE" -mhe=on "${BASE}.7z" "${BASE}.zip" >/dev/null
-            rm -f "${BASE}.zip"
-            echo "artifact=${BASE}.7z" >> "$GITHUB_OUTPUT"
-            echo "Encrypted artifact produced (MANIFEST.txt stays in cleartext)."
+            "$SEVENZ" a -p"$BUNDLE_PASSPHRASE" -mhe=on "${BASE}.7z" \
+              "${BASE}.zip" "${BASE}-installer.exe" >/dev/null
+            rm -f "${BASE}.zip" "${BASE}-installer.exe"
+            echo "Encrypted ${BASE}.7z holds both the portable zip and the installer;"
+            echo "MANIFEST.txt stays in cleartext."
           else
-            echo "artifact=${BASE}.zip" >> "$GITHUB_OUTPUT"
-            echo "::warning::BUNDLE_PASSPHRASE not set -- the bridge is in cleartext inside the artifact."
+            echo "::warning::BUNDLE_PASSPHRASE not set -- the bridge is in cleartext in both forms."
           fi
-          echo "sha256 of published artifact:"; sha256sum "${BASE}."* 2>/dev/null || true
-          ls -la "${BASE}."*
+          echo "Published files + sha256:"; sha256sum TorBrowser-ourtor-${V}.* 2>/dev/null || true
+          ls -la TorBrowser-ourtor-${V}.*
 
       - name: Upload private artifact
         if: steps.gate.outputs.build == 'true'
@@ -373,10 +412,12 @@ jobs:
         with:
           name: tor-browser-ourtor-${{ steps.ver.outputs.version }}
           path: |
-            ${{ steps.pkg.outputs.artifact }}
-            *.MANIFEST.txt
+            TorBrowser-ourtor-*.7z
+            TorBrowser-ourtor-*.zip
+            TorBrowser-ourtor-*-installer.exe
+            TorBrowser-ourtor-*.MANIFEST.txt
           retention-days: 5
-          if-no-files-found: error
+          if-no-files-found: warn
 
       - name: Record built version
         if: steps.gate.outputs.build == 'true'
