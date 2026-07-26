@@ -158,7 +158,26 @@ jobs:
           echo "browser_dir=$BROWSER_DIR" >> "$GITHUB_OUTPUT"
           echo "OK: browser at $BROWSER_DIR"
 
+      - name: Snapshot the pristine official files (pre-change hashes)
+        id: pre
+        if: steps.gate.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          BROWSER_DIR='${{ steps.layout.outputs.browser_dir }}'
+          # Hash EVERY extracted file before we touch anything. Paths are kept
+          # relative to extracted/ so the manifest is stable across machines.
+          ( cd extracted && find . -type f -print0 | LC_ALL=C sort -z \
+              | xargs -0 sha256sum ) > official.manifest
+          echo "official files hashed: $(wc -l < official.manifest)"
+          OFFICIAL_PKG_SHA="$(sha256sum official.exe | awk '{print $1}')"
+          OFFICIAL_TOR_SHA="$(sha256sum "$BROWSER_DIR/TorBrowser/Tor/tor.exe" | awk '{print $1}')"
+          echo "official_pkg_sha=$OFFICIAL_PKG_SHA" >> "$GITHUB_OUTPUT"
+          echo "official_tor_sha=$OFFICIAL_TOR_SHA" >> "$GITHUB_OUTPUT"
+          echo "SHA256 official package : $OFFICIAL_PKG_SHA"
+          echo "SHA256 official tor.exe : $OFFICIAL_TOR_SHA"
+
       - name: Fetch our static tor.exe (latest The-Onion-Router release)
+        id: tor
         if: steps.gate.outputs.build == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -185,6 +204,9 @@ jobs:
                | grep -qiE 'lib(crypto|ssl|event|gcc|winpthread|zstd|lzma)|zlib1'; then
             echo "::error::fetched tor.exe imports mingw DLLs -- not self-contained"; exit 1
           fi
+          OUR_TOR_SHA="$(sha256sum our-tor.exe | awk '{print $1}')"
+          echo "our_tor_sha=$OUR_TOR_SHA" >> "$GITHUB_OUTPUT"
+          echo "SHA256 our tor.exe      : $OUR_TOR_SHA"
 
       - name: Inject tor, disable updates, seed the bridge
         if: steps.gate.outputs.build == 'true'
@@ -222,7 +244,73 @@ jobs:
           } > "$PROF/user.js"
           echo "user.js written (bridge value hidden)."
 
-      - name: Package
+      - name: Prove only the declared files changed, and write the manifest
+        if: steps.gate.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          V='${{ steps.ver.outputs.version }}'
+          BROWSER_DIR='${{ steps.layout.outputs.browser_dir }}'
+
+          # Re-hash the whole tree AFTER injection.
+          ( cd extracted && find . -type f -print0 | LC_ALL=C sort -z \
+              | xargs -0 sha256sum ) > product.manifest
+
+          # The three paths (relative to extracted/, "./"-prefixed) we allow to change.
+          rel() { printf './%s\n' "${1#extracted/}"; }
+          REL_TOR="$(rel "$BROWSER_DIR/TorBrowser/Tor/tor.exe")"
+          REL_POL="$(rel "$BROWSER_DIR/distribution/policies.json")"
+          REL_USR="$(rel "$BROWSER_DIR/TorBrowser/Data/Browser/profile.default/user.js")"
+          printf '%s\n' "$REL_TOR" "$REL_POL" "$REL_USR" | LC_ALL=C sort -u > allowed.paths
+
+          # Every path that is added, removed, or content-changed vs official.
+          diff <(LC_ALL=C sort official.manifest) <(LC_ALL=C sort product.manifest) \
+            | grep -E '^[<>] ' \
+            | sed -E 's/^[<>] [0-9a-f]{64}  //' \
+            | LC_ALL=C sort -u > differing.paths
+          echo "Files that differ from the official package:"; cat differing.paths
+
+          # Anything outside the allowed three is a hard failure -- refuse to ship.
+          # (This catches bugs/accidental changes. It runs inside this same CI,
+          # so it does NOT defend against a fully compromised runner; that needs
+          # independent reproduction of the per-file manifest below.)
+          UNEXPECTED="$(LC_ALL=C comm -23 differing.paths allowed.paths || true)"
+          if [ -n "$UNEXPECTED" ]; then
+            echo "::error::files changed beyond the declared three -- refusing to publish:"
+            printf '%s\n' "$UNEXPECTED"
+            exit 1
+          fi
+          echo "OK: only tor.exe, policies.json and user.js differ from official."
+
+          POL_SHA="$(sha256sum "$BROWSER_DIR/distribution/policies.json" | awk '{print $1}')"
+          USR_SHA="$(sha256sum "$BROWSER_DIR/TorBrowser/Data/Browser/profile.default/user.js" | awk '{print $1}')"
+          {
+            echo "Tor Browser repackage manifest"
+            echo "=============================="
+            echo "official version          : $V"
+            echo "official package sha256   : ${{ steps.pre.outputs.official_pkg_sha }}"
+            echo "official package GPG      : verified (Tor Browser Developers,"
+            echo "                            EF6E286DDA85EA2A4BA7DE684E2C6E8793298290)"
+            echo
+            echo "Changed files (relative to the browser root):"
+            echo "  Browser/TorBrowser/Tor/tor.exe        [replaced]"
+            echo "     before (official) sha256: ${{ steps.pre.outputs.official_tor_sha }}"
+            echo "     after  (our tor)  sha256: ${{ steps.tor.outputs.our_tor_sha }}"
+            echo "     source: KernelKraze/The-Onion-Router release (windows-mingw64)"
+            echo "  Browser/distribution/policies.json    [added]"
+            echo "     sha256 : $POL_SHA"
+            echo "     content: {\"policies\":{\"DisableAppUpdate\":true}}"
+            echo "  Browser/TorBrowser/Data/Browser/profile.default/user.js  [added]"
+            echo "     sha256 : $USR_SHA"
+            echo "     content: obfs4 bridge (redacted) + quickstart auto-connect prefs"
+            echo
+            echo "Assertion: every other file is byte-identical to the official"
+            echo "Tor Browser $V package. To verify independently: download that"
+            echo "official package, confirm its sha256 above, extract both, and"
+            echo "compare per-file hashes -- only the three files above may differ."
+          } > MANIFEST.txt
+          echo "----- MANIFEST.txt -----"; cat MANIFEST.txt
+
+      - name: Package (deterministic)
         id: pkg
         if: steps.gate.outputs.build == 'true'
         env:
@@ -231,20 +319,32 @@ jobs:
           set -euo pipefail
           V='${{ steps.ver.outputs.version }}'
           BROWSER_DIR='${{ steps.layout.outputs.browser_dir }}'
-          # Package root = the "Tor Browser" folder (parent of Browser/).
-          ROOT="$(dirname "$BROWSER_DIR")"
+          ROOT="$(dirname "$BROWSER_DIR")"          # the "Tor Browser" folder
           BASE="TorBrowser-ourtor-${V}"
-          ( cd "$ROOT/.." && zip -r -q "$GITHUB_WORKSPACE/${BASE}.zip" "$(basename "$ROOT")" \
-              -x '*/.DS_Store' )
+
+          # Deterministic zip: fixed mtimes, sorted entries, no extra fields, so
+          # a third party can reproduce the same archive. NOTE: byte-for-byte
+          # also requires the same zip/zlib version -- the tool-independent
+          # anchor is the per-file MANIFEST.txt, not the container bytes.
+          export TZ=UTC
+          SDE=1609459200   # 2021-01-01 UTC, fixed
+          find "$ROOT" -exec touch --no-dereference -d "@${SDE}" {} +
+          ( cd "$ROOT/.." && \
+            find "$(basename "$ROOT")" ! -name '.DS_Store' | LC_ALL=C sort \
+              | zip -X -q -@ "$GITHUB_WORKSPACE/${BASE}.zip" )
+
+          cp MANIFEST.txt "${BASE}.MANIFEST.txt"
+
           if [ -n "${BUNDLE_PASSPHRASE:-}" ]; then
             7zz a -p"$BUNDLE_PASSPHRASE" -mhe=on "${BASE}.7z" "${BASE}.zip" >/dev/null
             rm -f "${BASE}.zip"
             echo "artifact=${BASE}.7z" >> "$GITHUB_OUTPUT"
-            echo "Encrypted artifact produced."
+            echo "Encrypted artifact produced (MANIFEST.txt stays in cleartext)."
           else
             echo "artifact=${BASE}.zip" >> "$GITHUB_OUTPUT"
             echo "::warning::BUNDLE_PASSPHRASE not set -- the bridge is in cleartext inside the artifact."
           fi
+          echo "sha256 of published artifact:"; sha256sum "${BASE}."* 2>/dev/null || true
           ls -la "${BASE}."*
 
       - name: Upload private artifact
@@ -252,7 +352,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: tor-browser-ourtor-${{ steps.ver.outputs.version }}
-          path: ${{ steps.pkg.outputs.artifact }}
+          path: |
+            ${{ steps.pkg.outputs.artifact }}
+            *.MANIFEST.txt
           retention-days: 5
           if-no-files-found: error
 
