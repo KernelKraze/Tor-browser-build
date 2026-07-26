@@ -1,0 +1,264 @@
+name: Repackage Tor Browser with our tor
+
+# Take the OFFICIAL Windows Tor Browser, swap in our statically-linked tor.exe,
+# disable auto-update, and pre-seed a private obfs4 bridge with auto-connect.
+# This does NOT compile Firefox -- our only delta is tor -- so it finishes in
+# minutes, not the hours a full browser build needs.
+#
+# Trigger: polls daily for a newer official version and rebuilds when one
+# appears; also runnable on demand. The bridge is injected from a secret and is
+# never stored in the repo.
+#
+# Required repository secrets:
+#   OBFS4_BRIDGE_LINE  - the full "obfs4 <ip:port> <fp> cert=... iat-mode=0" line
+# Optional:
+#   BUNDLE_PASSPHRASE  - if set, the output is encrypted (7z, AES-256, headers
+#                        encrypted) so the bridge stays private even if the
+#                        artifact is downloadable. Share the passphrase out of
+#                        band. WITHOUT this, anyone who can read this repo's
+#                        Actions artifacts gets your bridge -- keep the repo
+#                        private or set a passphrase.
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild even if the official version has not changed"
+        type: boolean
+        default: false
+  schedule:
+    # Daily poll. The gate step below skips the build when the official version
+    # is unchanged, so a no-op run costs ~30 seconds.
+    - cron: '0 4 * * *'
+
+concurrency:
+  group: repackage-browser
+  cancel-in-progress: true
+
+jobs:
+  repackage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Detect latest official Tor Browser version
+        id: ver
+        run: |
+          set -euo pipefail
+          # downloads.json publishes the current stable version + download map.
+          JSON="$(curl -fsSL https://aus1.torproject.org/torbrowser/update_3/release/downloads.json)"
+          VER="$(printf '%s' "$JSON" | jq -r '.version')"
+          if [ -z "$VER" ] || [ "$VER" = "null" ]; then
+            echo "::error::could not parse latest version from downloads.json"; exit 1
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "Latest official Tor Browser: $VER"
+
+      - name: Restore last-built marker
+        uses: actions/cache/restore@v4
+        with:
+          path: .last_built_version
+          key: tbb-repackaged-marker-${{ github.run_id }}
+          restore-keys: |
+            tbb-repackaged-marker-
+
+      - name: Decide whether to build
+        id: gate
+        run: |
+          set -euo pipefail
+          LAST="$(cat .last_built_version 2>/dev/null || echo none)"
+          echo "last built: $LAST ; latest: ${{ steps.ver.outputs.version }}"
+          if [ "${{ steps.ver.outputs.version }}" = "$LAST" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "Already repackaged this version; nothing to do."
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install tools
+        if: steps.gate.outputs.build == 'true'
+        run: |
+          sudo apt-get -qq update
+          # `7zip` provides 7zz (7-Zip >=23), which can unpack NSIS installers.
+          sudo apt-get -qq install -y 7zip jq zip curl file gnupg
+
+      - name: Download official portable installer
+        if: steps.gate.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          V='${{ steps.ver.outputs.version }}'
+          URL="https://dist.torproject.org/torbrowser/${V}/tor-browser-windows-x86_64-portable-${V}.exe"
+          echo "Downloading $URL"
+          curl -fSL "$URL" -o official.exe
+          curl -fSL "${URL}.asc" -o official.exe.asc
+          ls -la official.exe official.exe.asc
+
+      - name: Verify the official package is genuinely signed by Tor
+        if: steps.gate.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          # Tor Browser Developers signing key (primary fingerprint), per
+          # https://support.torproject.org/tbb/how-to-verify-signature/
+          TB_KEY="EF6E286DDA85EA2A4BA7DE684E2C6E8793298290"
+
+          export GNUPGHOME="$(mktemp -d)"
+          chmod 700 "$GNUPGHOME"
+          # Fetch the key the way the official instructions do (WKD), with
+          # keyserver fallbacks so a single source being down does not block us.
+          gpg --batch --auto-key-locate nodefault,wkd \
+              --locate-keys torbrowser@torproject.org \
+            || gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys "$TB_KEY" \
+            || gpg --batch --keyserver hkps://keyserver.ubuntu.com --recv-keys "$TB_KEY" \
+            || { echo "::error::could not obtain the Tor Browser signing key"; exit 1; }
+
+          # Verify against the machine-readable status, not the human text.
+          # A GOOD signature is not enough on its own -- it must be a VALID
+          # signature chaining to EXACTLY the Tor Browser Developers key, or a
+          # good signature from some other key would pass. VALIDSIG's trailing
+          # field is the primary-key fingerprint.
+          STATUS="$(gpg --batch --status-fd 1 --verify official.exe.asc official.exe 2>/dev/null || true)"
+          echo "$STATUS"
+          if ! printf '%s\n' "$STATUS" | grep -Eq "^\[GNUPG:\] VALIDSIG .*${TB_KEY}\$"; then
+            echo "::error::GPG verification FAILED -- not a valid signature from ${TB_KEY}. Aborting before touching the package."
+            exit 1
+          fi
+          echo "GPG OK: official Tor Browser is genuinely signed by the Tor Browser Developers."
+
+      - name: Extract the NSIS payload
+        if: steps.gate.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          rm -rf extracted && mkdir extracted
+          # 7zz understands NSIS; -y assume yes, -o output dir (no space).
+          7zz x -y -oextracted official.exe >/dev/null || {
+            echo "::error::7zz failed to extract the NSIS installer"; exit 1; }
+          echo "Top of extracted tree:"; ls -la extracted | head
+
+      - name: Locate the browser tree (anchor on firefox.exe)
+        id: layout
+        if: steps.gate.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          # Do not assume the NSIS layout; find firefox.exe and derive paths.
+          FF="$(find extracted -type f -iname 'firefox.exe' | head -1 || true)"
+          if [ -z "$FF" ]; then
+            echo "::error::firefox.exe not found -- unexpected NSIS layout. Tree:"
+            find extracted -maxdepth 3 | head -50
+            exit 1
+          fi
+          BROWSER_DIR="$(dirname "$FF")"                 # .../Browser
+          TOR_EXE="$BROWSER_DIR/TorBrowser/Tor/tor.exe"
+          PROFILE="$BROWSER_DIR/TorBrowser/Data/Browser/profile.default"
+          for p in "$TOR_EXE" "$(dirname "$PROFILE")"; do
+            if [ ! -e "$p" ]; then
+              echo "::error::expected path missing: $p -- layout differs. Tree:"
+              find "$BROWSER_DIR" -maxdepth 3 | head -60
+              exit 1
+            fi
+          done
+          echo "browser_dir=$BROWSER_DIR" >> "$GITHUB_OUTPUT"
+          echo "OK: browser at $BROWSER_DIR"
+
+      - name: Fetch our static tor.exe (latest The-Onion-Router release)
+        if: steps.gate.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Public release asset -> resolve its download URL, then curl it
+          # (the asset itself needs no auth; gh api only reads public metadata).
+          URL="$(gh api repos/KernelKraze/The-Onion-Router/releases/latest \
+                   --jq '.assets[] | select(.name | test("windows-mingw64")) | .browser_download_url' \
+                 | head -1)"
+          if [ -z "$URL" ]; then
+            echo "::error::no windows-mingw64 asset on the latest The-Onion-Router release"; exit 1
+          fi
+          echo "tor.exe asset: $URL"
+          curl -fSL "$URL" -o our-tor.exe
+          file our-tor.exe
+          # Sanity: reject a non-self-contained (dynamic) build.
+          if strings -a our-tor.exe | grep -oE '[A-Za-z0-9_]+\.dll' | tr 'A-Z' 'a-z' | sort -u \
+               | grep -vE '^(advapi32|crypt32|iphlpapi|kernel32|kernelbase|msvcrt|shell32|shlwapi|user32|ws2_32|winsock|bcrypt|ntdll|ole32|secur32|gdi32|version|userenv|dnsapi|winmm)\.dll$' \
+               | grep -qiE 'lib(crypto|ssl|event|gcc|winpthread|zstd|lzma)|zlib1'; then
+            echo "::error::fetched tor.exe imports mingw DLLs -- not self-contained"; exit 1
+          fi
+
+      - name: Inject tor, disable updates, seed the bridge
+        if: steps.gate.outputs.build == 'true'
+        env:
+          BRIDGE_LINE: ${{ secrets.OBFS4_BRIDGE_LINE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BRIDGE_LINE:-}" ]; then
+            echo "::error::secret OBFS4_BRIDGE_LINE is not set"; exit 1
+          fi
+          case "$BRIDGE_LINE" in *'"'*)
+            echo "::error::bridge line must not contain a double quote"; exit 1 ;;
+          esac
+          BROWSER_DIR='${{ steps.layout.outputs.browser_dir }}'
+
+          # 1) swap tor
+          cp our-tor.exe "$BROWSER_DIR/TorBrowser/Tor/tor.exe"
+
+          # 2) disable auto-update (Firefox enterprise policy, next to firefox.exe)
+          mkdir -p "$BROWSER_DIR/distribution"
+          printf '%s\n' '{"policies":{"DisableAppUpdate":true}}' \
+            > "$BROWSER_DIR/distribution/policies.json"
+
+          # 3) pre-seed the bridge + auto-connect. Pref names/values verified
+          #    against TorSettings.sys.mjs (UserProvided=2) and
+          #    TorConnect.sys.mjs (quickstart needs prompt_at_startup=false).
+          PROF="$BROWSER_DIR/TorBrowser/Data/Browser/profile.default"
+          mkdir -p "$PROF"
+          {
+            echo 'user_pref("torbrowser.settings.bridges.enabled", true);'
+            echo 'user_pref("torbrowser.settings.bridges.source", 2);'
+            printf 'user_pref("torbrowser.settings.bridges.bridge_strings.0", "%s");\n' "$BRIDGE_LINE"
+            echo 'user_pref("torbrowser.settings.quickstart.enabled", true);'
+            echo 'user_pref("extensions.torlauncher.prompt_at_startup", false);'
+          } > "$PROF/user.js"
+          echo "user.js written (bridge value hidden)."
+
+      - name: Package
+        id: pkg
+        if: steps.gate.outputs.build == 'true'
+        env:
+          BUNDLE_PASSPHRASE: ${{ secrets.BUNDLE_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          V='${{ steps.ver.outputs.version }}'
+          BROWSER_DIR='${{ steps.layout.outputs.browser_dir }}'
+          # Package root = the "Tor Browser" folder (parent of Browser/).
+          ROOT="$(dirname "$BROWSER_DIR")"
+          BASE="TorBrowser-ourtor-${V}"
+          ( cd "$ROOT/.." && zip -r -q "$GITHUB_WORKSPACE/${BASE}.zip" "$(basename "$ROOT")" \
+              -x '*/.DS_Store' )
+          if [ -n "${BUNDLE_PASSPHRASE:-}" ]; then
+            7zz a -p"$BUNDLE_PASSPHRASE" -mhe=on "${BASE}.7z" "${BASE}.zip" >/dev/null
+            rm -f "${BASE}.zip"
+            echo "artifact=${BASE}.7z" >> "$GITHUB_OUTPUT"
+            echo "Encrypted artifact produced."
+          else
+            echo "artifact=${BASE}.zip" >> "$GITHUB_OUTPUT"
+            echo "::warning::BUNDLE_PASSPHRASE not set -- the bridge is in cleartext inside the artifact."
+          fi
+          ls -la "${BASE}."*
+
+      - name: Upload private artifact
+        if: steps.gate.outputs.build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tor-browser-ourtor-${{ steps.ver.outputs.version }}
+          path: ${{ steps.pkg.outputs.artifact }}
+          retention-days: 5
+          if-no-files-found: error
+
+      - name: Record built version
+        if: steps.gate.outputs.build == 'true'
+        run: printf '%s' '${{ steps.ver.outputs.version }}' > .last_built_version
+
+      - name: Save last-built marker
+        if: steps.gate.outputs.build == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .last_built_version
+          key: tbb-repackaged-marker-${{ github.run_id }}
