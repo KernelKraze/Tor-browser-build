@@ -78,8 +78,18 @@ jobs:
         if: steps.gate.outputs.build == 'true'
         run: |
           sudo apt-get -qq update
-          # `7zip` provides 7zz (7-Zip >=23), which can unpack NSIS installers.
-          sudo apt-get -qq install -y 7zip jq zip curl file gnupg
+          # Need a 7-Zip that can unpack NSIS. Install the modern 7-Zip (`7zz`
+          # from the 7zip package) and p7zip-full (`7z`) as a fallback, then use
+          # whichever binary is actually present.
+          sudo apt-get -qq install -y jq zip curl file gnupg p7zip-full 7zip \
+            || sudo apt-get -qq install -y jq zip curl file gnupg p7zip-full
+          SEVENZ="$(command -v 7zz || command -v 7z || command -v 7za || true)"
+          if [ -z "$SEVENZ" ]; then
+            echo "::error::no 7-Zip binary (7zz/7z/7za) available"; exit 1
+          fi
+          echo "7-Zip binaries present: $(command -v 7zz 7z 7za 2>/dev/null | tr '\n' ' ')"
+          echo "using 7-Zip: $SEVENZ"
+          echo "SEVENZ=$SEVENZ" >> "$GITHUB_ENV"
 
       - name: Download official portable installer
         if: steps.gate.outputs.build == 'true'
@@ -128,9 +138,9 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf extracted && mkdir extracted
-          # 7zz understands NSIS; -y assume yes, -o output dir (no space).
-          7zz x -y -oextracted official.exe >/dev/null || {
-            echo "::error::7zz failed to extract the NSIS installer"; exit 1; }
+          # 7-Zip understands NSIS; -y assume yes, -o output dir (no space).
+          "$SEVENZ" x -y -oextracted official.exe >/dev/null || {
+            echo "::error::$SEVENZ failed to extract the NSIS installer"; exit 1; }
           echo "Top of extracted tree:"; ls -la extracted | head
 
       - name: Locate the browser tree (anchor on firefox.exe)
@@ -336,7 +346,7 @@ jobs:
           cp MANIFEST.txt "${BASE}.MANIFEST.txt"
 
           if [ -n "${BUNDLE_PASSPHRASE:-}" ]; then
-            7zz a -p"$BUNDLE_PASSPHRASE" -mhe=on "${BASE}.7z" "${BASE}.zip" >/dev/null
+            "$SEVENZ" a -p"$BUNDLE_PASSPHRASE" -mhe=on "${BASE}.7z" "${BASE}.zip" >/dev/null
             rm -f "${BASE}.zip"
             echo "artifact=${BASE}.7z" >> "$GITHUB_OUTPUT"
             echo "Encrypted artifact produced (MANIFEST.txt stays in cleartext)."
